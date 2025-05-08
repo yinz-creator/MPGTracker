@@ -1,0 +1,2386 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import os
+import numpy as np
+import time
+import torch
+
+from lib.utils.opts import opts
+
+from lib.models.stNet import get_det_net, load_model
+from lib.dataset.coco import COCO
+
+from lib.external.nms import soft_nms
+
+from lib.utils.decode import ctdet_decode
+from lib.utils.post_process import ctdet_post_process
+
+from lib.utils.sort import *
+import torch.nn.functional as F
+
+import cv2
+
+from progress.bar import Bar
+from log_helper import log_print
+import motmetrics as mm
+import pickle
+
+CONFIDENCE_thres = 0.3
+COLORS = [(255, 0, 0)]
+global_track_id_counter = 0
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+def cv2_demo(frame, detections):
+    det = []
+    for i in range(detections.shape[0]):
+        if detections[i, 4] >= CONFIDENCE_thres:
+            pt = detections[i, :]
+            cv2.rectangle(frame,(int(pt[0])-4, int(pt[1])-4),(int(pt[2])+4, int(pt[3])+4),COLORS[0], 2)
+            cv2.putText(frame, str(pt[4]), (int(pt[0]), int(pt[1])), FONT, 1, (0, 255, 0), 1)
+            det.append([int(pt[0]), int(pt[1]),int(pt[2]), int(pt[3]),detections[i, 4]])
+    return frame, det
+
+def process(model, image, return_time):
+    with torch.no_grad():
+        output = model(image)[-1]
+        hm = output['hm'].sigmoid_()
+        wh = output['wh']
+        reg = output['reg']
+        forward_time = time.time()
+        dets = ctdet_decode(hm, wh, reg=reg)
+    if return_time:
+        return output, dets, forward_time
+    else:
+        return output, model.feature, dets
+
+def post_process(dets, meta, num_classes=1, scale=1):
+    dets = dets.detach().cpu().numpy()
+    dets = dets.reshape(1, -1, dets.shape[2])
+    dets = ctdet_post_process(
+        dets.copy(), [meta['c']], [meta['s']],
+        meta['out_height'], meta['out_width'], num_classes)
+    for j in range(1, num_classes + 1):
+        dets[0][j] = np.array(dets[0][j], dtype=np.float32).reshape(-1, 5)
+        dets[0][j][:, :4] /= scale
+    return dets[0]
+
+def pre_process(image, scale=1):
+    height, width = image.shape[2:4]
+    new_height = int(height * scale)
+    new_width = int(width * scale)
+
+    inp_height, inp_width = height, width
+    c = np.array([new_width / 2., new_height / 2.], dtype=np.float32)
+    s = max(height, width) * 1.0
+
+    meta = {'c': c, 's': s,
+            'out_height': inp_height ,
+            'out_width': inp_width}
+    return meta
+
+def merge_outputs(detections, num_classes ,max_per_image):
+    results = {}
+    for j in range(1, num_classes + 1):
+        results[j] = np.concatenate(
+            [detection[j] for detection in detections], axis=0).astype(np.float32)
+
+        soft_nms(results[j], Nt=0.5, method=2)
+
+    scores = np.hstack(
+      [results[j][:, 4] for j in range(1, num_classes + 1)])
+    if len(scores) > max_per_image:
+        kth = len(scores) - max_per_image
+        thresh = np.partition(scores, kth)[kth]
+        for j in range(1, num_classes + 1):
+            keep_inds = (results[j][:, 4] >= thresh)
+            results[j] = results[j][keep_inds]
+    return results
+
+def extract_features_for_class_1(ret, feature_map):
+    h_map, w_map = feature_map.shape[2:]  # 特征图的高宽
+    f1 = []  # 存储类别号为 1 的外观特征
+
+    if 1 in ret:  # 检查类别号 1 是否存在
+        boxes = ret[1]
+        for box in boxes:
+            x_min, y_min, x_max, y_max, conf = box
+
+            # 检测框合法性检查
+            if x_max <= x_min or y_max <= y_min:
+                f1.append(torch.zeros(feature_map.size(1)))  # 填充零特征
+                continue
+
+            # 将检测框坐标映射到特征图坐标
+            x_min = int(max(0, x_min * w_map / feature_map.size(-1)))
+            x_max = int(min(w_map, x_max * w_map / feature_map.size(-1)))
+            y_min = int(max(0, y_min * h_map / feature_map.size(-2)))
+            y_max = int(min(h_map, y_max * h_map / feature_map.size(-2)))
+
+            # 检查裁剪区域有效性
+            if x_max <= x_min or y_max <= y_min:
+                f1.append(torch.zeros(feature_map.size(1)))  # 填充零特征
+                continue
+
+            # 裁剪特征图
+            cropped_feature = feature_map[:, :, y_min:y_max, x_min:x_max]
+
+            # 特殊处理空裁剪区域
+            if cropped_feature.numel() == 0:
+                feature_vector = torch.zeros(feature_map.size(1))  # 填充零特征
+            else:
+                pooled_feature = F.adaptive_avg_pool2d(cropped_feature, (1, 1))
+                feature_vector = pooled_feature.view(-1)
+
+            # 添加特征向量
+            f1.append(feature_vector)
+
+    # 将类别号 1 的外观特征加入 ret
+    ret['f1'] = f1
+    return ret
+
+def save_videos_cells_by_t(videos_cells_by_t, filepath):
+    """保存 videos_cells_by_t 到本地文件"""
+    with open(filepath, 'wb') as f:
+        pickle.dump(videos_cells_by_t, f)
+
+def load_videos_cells_by_t(filepath):
+    """从本地文件加载 videos_cells_by_t"""
+    with open(filepath, 'rb') as f:
+        videos_cells_by_t = pickle.load(f)
+    return videos_cells_by_t
+
+
+def test(opt, split, modelPath, show_flag, results_name):
+
+    # os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpus_str
+
+    # # Logger(opt)
+    # print(opt.model_name)
+
+    # dataset = COCO(opt, split)
+
+    # data_loader = torch.utils.data.DataLoader(
+    #     dataset,
+    #     batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
+
+    # model = get_det_net({'hm': dataset.num_classes, 'wh': 2, 'reg': 2}, opt.model_name)  # 建立模型
+    # model = load_model(model, modelPath)
+    # device = torch.device("cuda:1")  # 指定使用的 GPU
+    # model = model.cuda()
+    # model.eval()
+
+    # results = {}
+    # res = {}
+    # return_time = False
+    # scale = 1
+    # num_classes = dataset.num_classes
+    # max_per_image = opt.K
+
+    # file_folder_pre = ''
+    # im_count = 0
+
+    # saveTxt = opt.save_track_results
+    # if saveTxt:
+    #     #track_results_save_dir = os.path.join(opt.save_results_dir, 'trackingResults'+opt.model_name)
+    #     track_results_save_dir = os.path.join(opt.save_results_dir, 'trackingResults'+'sort')
+    #     if not os.path.exists(track_results_save_dir):
+    #         os.mkdir(track_results_save_dir)
+
+    # num_iters = len(data_loader)
+    # bar = Bar('processing', max=num_iters)
+    # videoName= '/test_'+str(CONFIDENCE_thres)+'.mp4'
+
+    # fps=10
+    # size=(1024,1024)
+    # fourcc=cv2.VideoWriter_fourcc(*'mp4v')
+    # videoWriter=cv2.VideoWriter(videoName,fourcc,fps,size)
+    # cnt = 0
+
+    # for ind, (file_path, img_id, pre_processed_images) in enumerate(data_loader):
+    #     # print(ind)
+    #     if(ind>len(data_loader)-1):
+    #         break
+
+    #     bar.suffix = '[{0}/{1}]|Tot: {total:} |ETA: {eta:} '.format(
+    #         ind, num_iters,total=bar.elapsed_td, eta=bar.eta_td
+    #     )
+
+    #     #set tracker
+    #     file_folder_cur = pre_processed_images['file_name'][0].split('/')[-3]
+    #     if file_folder_cur != file_folder_pre:
+    #         if saveTxt and file_folder_pre!='':
+    #              fid.close()
+    #         file_folder_pre = file_folder_cur
+    #         mot_tracker = Sort()
+    #         if saveTxt:
+    #             im_count = 0
+    #             txt_path = os.path.join(track_results_save_dir, file_folder_cur+'.txt')
+    #             fid = open(txt_path, 'w+')
+
+    #     #read images
+    #     detection = []
+    #     meta = pre_process(pre_processed_images['input'], scale)
+    #     image = pre_processed_images['input'].cuda()
+    #     img = pre_processed_images['imgOri'].squeeze().numpy()
+
+    #     #detection
+    #     output, feature, dets = process(model, image, return_time)
+    #     #POST PROCESS
+    #     dets = post_process(dets, meta, num_classes)
+    #     detection.append(dets)
+    #     ret = merge_outputs(detection, num_classes, max_per_image)
+
+    #     #update tracker
+    #     dets_track = dets[1]
+    #     dets_track_select = np.argwhere(dets_track[:,-1]>CONFIDENCE_thres)
+    #     dets_track = dets_track[dets_track_select[:,0],:]
+    #     track_bbs_ids = mot_tracker.update(dets_track)
+        
+    #     if(show_flag):
+    #         frame, det = cv2_demo(img, track_bbs_ids)
+            
+    #         cv2.imwrite(f'results/frame_{ind}.jpg',img)
+    #         # 写入视频
+    #         videoWriter.write(frame)
+
+    #         #cv2.waitKey(5)
+    #         #hm1 = output['hm'].squeeze(0).squeeze(0).cpu().detach().numpy()
+    #         #img2 = cv2.resize(hm1,(1280,720))
+    #         #video2.write(img2)
+    #         #cv2.imshow('hm', hm1)
+    #         #cv2.waitKey(5)
+
+    #     if saveTxt:
+    #         im_count += 1
+    #         track_bbs_ids = track_bbs_ids[::-1,:]
+    #         track_bbs_ids[:,2:4] = track_bbs_ids[:,2:4]-track_bbs_ids[:,:2]
+    #         for it in range(track_bbs_ids.shape[0]):
+    #             #print(track_bbs_ids[it,-1])
+    #             #print('\n')
+    #             fid.write('%d,%d,%0.2f,%0.2f,%0.2f,%0.2f,1,-1,-1,-1\n'%(im_count,
+    #                       track_bbs_ids[it,-1], track_bbs_ids[it,0],track_bbs_ids[it,1],
+    #                             track_bbs_ids[it, 2], track_bbs_ids[it, 3]))
+    #             #im_count,track_bbs_ids[it,-1], track_bbs_ids[it,0],track_bbs_ids[it,1],track_bbs_ids[it, 2], track_bbs_ids[it, 3]
+    #     results[img_id.numpy().astype(np.int32)[0]] = ret
+    #     ret = extract_features_for_class_1(ret, feature)
+    #     res[file_path[0]] = ret
+    #     bar.next()
+    #     cnt += 1
+    #     # if cnt%400==0:
+    #     #     break
+    # bar.finish()
+
+
+    '''
+    begin
+    '''
+    # 定义配置字典
+    # optim_config = {
+    #     # 边权重相关配置
+    #     'confidence_function': 'linear',         # 置信度函数：'linear'、'quadratic'、'constant'
+    #     'weight_position': 1.0,                  # 位置差异的权重 a
+    #     'weight_velocity': 1.0,                  # 速度差异的权重 b
+    #     'weight_appearance': 1.0,                # 外观差异的权重 c
+    #     'epsilon': 1e-6,
+    #     'gaussian_sigma': 1.0,                   # 高斯函数的标准差
+
+    #     # 超参数配置
+    #     'max_children': 3,                      # 每个节点最多的关联数量
+    #     'distance_threshold': 10,               # 关联的距离阈值
+    #     'confidence_threshold': 0.3,            # 置信度阈值
+
+    #     # 约束条件配置
+    #     'add_trajectory_start_end_costs': False,# 是否添加轨迹起始和终止成本
+    #     'start_cost': 0.1,                      # 轨迹起始成本
+    #     'end_cost': 0.1,                        # 轨迹终止成本
+    #     'min_track_length': None,               # 轨迹的最小长度
+    #     'max_track_length': None,               # 轨迹的最大长度
+
+    #     # 遮挡和目标消失处理配置
+    #     'allow_missing_detections': False,      # 是否允许轨迹中断（缺失检测）
+    #     'max_missing_frames': 0,                # 允许的最大缺失帧数
+
+    #     # 长时间跨度关联配置
+    #     'time_window': 1,                       # 关联的时间窗口大小，默认为1表示仅相邻帧
+    # }
+    global global_track_id_counter
+    import itertools
+    static_config = {
+        'confidence_function': 'quadratic',
+        'weight_position': 10,
+        'weight_velocity': 30,#[0, 1, 10, 30, 50, 100],
+        'weight_appearance': 50,#, 10, 30, 50, 100],
+        'gaussian_sigma': 2,
+    }
+
+    # 参数取值范围
+    # best：
+    # 'confidence_function': 'quadratic', 'weight_position': 10, 'weight_velocity': 30, 'weight_appearance': 50, 'epsilon': 1, 'sigma_position': 2, 'sigma_velocity': 2
+    param_ranges = {
+        'start_cost': [0.1],#, 0.5, 1, 5, 10],
+        'end_cost': [0.1],#, 0.5, 1, 5, 10],
+        'min_track_length': [1],
+        'max_track_length': [None],#, 50, 80, 100, 150, 200, None],
+        'max_missing_frames': [0],#, 1, 2, 3, 5, 8, 10],
+        'density_threshold': [0.45],
+        'min_distance_threshold': [2],
+        'delta_p_max': [5],#, 7, 9],
+        'delta_v_max': [2],#, 4],
+        'max_virtual':[10, 15, 20, 25, 30],
+        'n_kf_frames':[4],#, 6],
+        'a': [1],
+        'b': [1]
+    }
+
+    optim_configs = [
+        {
+            **static_config,  # 添加固定配置
+            'start_cost': comb[0],
+            'end_cost': comb[1],
+            'min_track_length': comb[2],
+            'max_track_length': comb[3],
+            'max_missing_frames': comb[4],
+            'density_threshold': comb[5],
+            'min_distance_threshold': comb[6],
+            'delta_p_max': comb[7],
+            'delta_v_max': comb[8],
+            'max_virtual': comb[9],
+            'n_kf_frames':comb[10],
+            'a': comb[11],
+            'b': comb[12]
+        }
+        for comb in itertools.product(
+            param_ranges['start_cost'],
+            param_ranges['end_cost'],
+            param_ranges['min_track_length'],
+            param_ranges['max_track_length'],
+            param_ranges['max_missing_frames'],
+            param_ranges['density_threshold'],
+            param_ranges['min_distance_threshold'],
+            param_ranges['delta_p_max'],
+            param_ranges['delta_v_max'],
+            param_ranges['max_virtual'],
+            param_ranges['n_kf_frames'],
+            param_ranges['a'],
+            param_ranges['b'],
+        )
+    ]
+
+    best_mota = 0.0
+    best_idf1 = 0.0
+
+    cache_filepath = 'videos_cells_by_t.pkl'
+
+    
+    # video_gt_dict, first_appear_dict = parse_all_ground_truths("data/viso/test")
+    # videos_cells_by_t = build_videos_cells_by_t(
+    #     res,
+    #     video_gt_dict,
+    #     first_appear_dict,
+    #     area_percentage=10
+    # )
+
+    videos_cells_by_t = load_videos_cells_by_t(cache_filepath)
+    # save_videos_cells_by_t(videos_cells_by_t, cache_filepath)
+
+    for idx, optim_config in enumerate(optim_configs):
+        save_dir = 'tracking_results'
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # 评估累计
+        all_summaries=[]
+        for video_name, cells_by_t in videos_cells_by_t.items():
+            # 1) 构建图
+            log_print("map")
+            G = create_graph(cells_by_t, optim_config)
+            
+            # 2) 一次ILP
+            solution_edges_initial = solve_ilp(G, optim_config)
+            if solution_edges_initial is None:
+                print("No ILP solution for", video_name)
+                continue
+            
+            # 3) parse初步轨迹
+            pred_tracks_initial, frame_tracks = parse_prediction(solution_edges_initial)
+            print(f"Initial ILP found {len(pred_tracks_initial)} tracks for {video_name}.")
+
+            # 4) 后处理: 在数据结构层面插入虚拟节点，衔接碎片
+            pred_tracks_final = insert_virtual_nodes(pred_tracks_initial, cells_by_t, optim_config)
+
+            # 5) 去掉虚拟节点 & 过滤最短轨迹
+            pred_tracks_post = post_process_tracks(pred_tracks_final, optim_config)
+
+            # 6) 重建 frame_tracks，用于评估或保存
+            frame_tracks = rebuild_frame_tracks_from_pred_tracks(pred_tracks_post)
+
+                 
+            # 保存跟踪结果到 txt 文件
+            txt_path = os.path.join(save_dir, f'{video_name}.txt')
+            with open(txt_path, 'w') as f:
+                for frame_id in sorted(frame_tracks.keys()):
+                    tracks_in_frame = frame_tracks[frame_id]
+                    for track in tracks_in_frame:
+                        # track 至少6 => (tid, x,y,w,h,is_v)
+                        tid, x, y, w, h, isv = track[:6]
+                        
+                        # 若还有第7个 => 可能是 conf or vx?
+                        # 若您是 conf => conf = track[6]
+                        # else: conf = None
+                        conf = None
+                        if len(track) >= 7:
+                            # 根据需求判断 track[6] 是否 float => conf
+                            # or if isinstance(track[6], bool) => skip
+                            maybe_7th = track[6]
+                            if isinstance(maybe_7th, (float,int)):
+                                conf = maybe_7th
+                            # else it might be vx => ignore or parse differently
+                        
+                        # isv_str
+                        isv_str = "1" if isv else "0"
+                        
+                        if conf is not None:
+                            f.write(f"{frame_id},{tid},{x:.2f},{y:.2f},{w:.2f},{h:.2f},{isv_str},{conf:.2f}\n")
+                        else:
+                            f.write(f"{frame_id},{tid},{x:.2f},{y:.2f},{w:.2f},{h:.2f},{isv_str}\n")
+        log_print("fin")
+
+        # 跟踪评估
+        truth_dir = '/home/yinz/workspace/evaluation/gt/*.txt'
+        result_dir = '/home/yinz/workspace/DSFNet/tracking_results/*.txt'
+        all_summaries = []
+
+        # Store the summaries in a DataFrame
+        summary_list = []
+
+        # Process each ground truth and prediction file pair
+        for truth_path, result_path in zip(sorted(glob.glob(truth_dir)), sorted(glob.glob(result_dir))):
+            truths = pd.read_csv(
+                truth_path,
+                header=None,
+                names=['frame', 'id', 'left', 'top', 'width', 'height', 'conf', 'x', 'y', 'z','a','b','c'],
+                index_col=False
+            )
+            predictions = pd.read_csv(
+                result_path,
+                header=None,
+                names=['frame', 'id', 'left', 'top', 'width', 'height', 'is_virt'],
+                index_col=False
+            )
+
+            predictions = remove_tail_virtual_nodes(predictions)
+
+            # Convert bbox coordinates
+            truths = convert_bbox_to_mot(truths)
+            predictions = convert_bbox_to_mot(predictions)
+
+            # Evaluate tracking
+            acc = evaluate(truths, predictions)
+            mh = mm.metrics.create()
+            summary = mh.compute(acc, metrics=[
+            'mota', 'idf1', 'mostly_tracked', 'mostly_lost', 'num_false_positives', 'num_misses', 'num_switches'
+            ], name='metrics')
+            all_summaries.append(summary)
+
+            # Extract file name for simplified output
+            result_name = result_path.split('/')[-1].split('.')[0]
+            summary_row = [result_name] + summary.iloc[0].tolist()
+            summary_list.append(summary_row)
+
+        # Create a DataFrame for all summaries
+        columns = ['name', 'mota', 'idf1', 'mostly_tracked', 'mostly_lost', 'num_false_positives', 'num_misses', 'num_switches']
+        summary_df = pd.DataFrame(summary_list, columns=columns)
+
+        # Print the summary table
+        log_print(f'\n{summary_df.to_string(index=False)}')
+
+        # Aggregate all summaries and calculate average
+        overall_summary = pd.concat(all_summaries).mean(axis=0)
+        print_optim_configs_method3(optim_config)
+        log_print(f'\n{overall_summary}')
+
+        if overall_summary['mota']>best_mota:
+            best_mota = overall_summary['mota']
+            log_print(update_best_mota = best_mota)
+        if overall_summary['idf1']>best_idf1:
+            best_idf1 = overall_summary['idf1']
+            log_print(update_best_idf1 = best_idf1)
+
+    # dataset.run_eval(results, opt.save_results_dir, results_name)
+
+import pandas as pd
+
+def print_optim_configs_method3(optim_config):
+    items = list(optim_config.items())
+    lines = []
+    for j in range(0, len(items), 3):
+        chunk = items[j:j+3]
+        formatted_chunk = ", ".join(f"{k}: {v}" for k, v in chunk)
+        lines.append(f"  {formatted_chunk}")
+    config_str = "\n".join(lines)
+    log_print(f'\n{config_str}')
+
+def remove_tail_virtual_nodes(predictions):
+    """
+    对同一 track_id 的帧，从最后一帧往前查找:
+      - 若是虚拟节点 is_virt=1 => 删除
+      - 若是真实节点 is_virt=0 => 停止往前
+    这样仅去掉轨迹末尾的“无效”虚拟节点, 保留中间/头部虚拟节点.
+
+    参数:
+      predictions: pd.DataFrame，含列 ['frame','id','is_virt', 以及 left/top/width/height等]
+                   假设 'frame' 和 'id' int, 'is_virt' => 0/1(或bool).
+    返回:
+      filtered_df: 去除尾部虚拟节点后的 DataFrame
+    """
+    # 1) 先按照 track_id, frame排序
+    #    我们要逆序 => frame descending
+    df = predictions.copy()
+    # 若 is_virt 可能是str => 先转int
+    df['is_virt'] = df['is_virt'].astype(int)
+    
+    df.sort_values(by=['id','frame'], ascending=[True,False], inplace=True)
+    
+    # 2) 分组
+    group_ids = df['id'].unique()
+    
+    # 结果收集
+    keep_index = []
+    
+    for tid in group_ids:
+        sub = df[df['id']==tid]  # 该 track
+        # sub已按 frame 降序排列
+        sub_indices = sub.index.tolist()  # 行号
+        sub_frames  = sub['frame'].tolist()
+        sub_virt    = sub['is_virt'].tolist()
+        
+        # 逆序遍历
+        remove_mode = True
+        # "remove_mode"表示我们还在移除阶段
+        # 一旦遇到 is_virt=0 => break => remove_mode=False => 以后都不删
+        for i, row_idx in enumerate(sub_indices):
+            if not remove_mode:
+                # 不再删除
+                keep_index.append(row_idx)
+                continue
+            
+            # 若还在 remove_mode => check is_virt
+            if sub_virt[i] == 1:
+                # => 这是虚拟节点,删除 => 不加到keep
+                # pass
+                pass
+            else:
+                # is_virt=0 => 真实节点 => stop remove
+                remove_mode = False
+                keep_index.append(row_idx)
+        
+        # 之后sub的剩余行我们不处理，因为都逆序遍历完了
+        # 但我们写在for i... => 全部遍历
+    
+    # keep_index里是保留行
+    filtered_df = df.loc[keep_index].copy()
+    
+    # 3) 排序回正序(如有需要)
+    filtered_df.sort_values(by=['id','frame'], ascending=[True,True], inplace=True)
+    filtered_df.reset_index(drop=True, inplace=True)
+    
+    return filtered_df
+
+
+def post_process_tracks(pred_tracks, optim_config):
+    """
+    1) 过滤真实节点数 < min_track_length 的轨迹
+    2) 保留虚拟节点，以供可视化或评估
+    假设 pred_tracks[tid][frame] 可能是:
+      (x, y, w, h, is_virtual) 或 (x, y, w, h, is_virtual, vx, vy)
+    """
+    min_track_length = optim_config.get('min_track_length', 2)
+    final_tracks = {}
+    
+    for tid, frames_dict in pred_tracks.items():
+        real_count = 0
+        for fr, box in frames_dict.items():
+            # 根据长度判断:
+            if len(box) >= 5:
+                # box[:5] => (x, y, w, h, isv)
+                # isv = box[4]
+                # 如果是 bool => True/False
+                isv = box[4]
+                # 若它是 bool => 说明 box[4] 为 is_virtual
+                # 真实节点 => if not isv
+                if isinstance(isv, bool):
+                    if not isv:
+                        real_count += 1
+                else:
+                    # box[4] 不是 bool => 说明这条数据没有 is_virtual
+                    # => 视为真实节点
+                    real_count += 1
+            else:
+                # 若 len(box)<5 => 可能是 (x,y,w,h) => 视为真实节点
+                real_count += 1
+        
+        if real_count >= min_track_length:
+            final_tracks[tid] = frames_dict
+    
+    return final_tracks
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import itertools
+import networkx as nx
+import pulp
+import motmetrics as mm
+from scipy.spatial import KDTree
+from sklearn.metrics.pairwise import cosine_similarity
+
+class KalmanFilter:
+    def __init__(self):
+        # 状态向量 [x, y, vx, vy]
+        self.state = np.zeros(4, dtype=np.float32)
+        self.P = np.eye(4, dtype=np.float32)
+        # 状态转移矩阵 (匀速模型)
+        self.F = np.array([[1, 0, 1, 0],
+                           [0, 1, 0, 1],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]], dtype=np.float32)
+        # 观测矩阵
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]], dtype=np.float32)
+        # 过程/观测噪声协方差
+        self.Q = np.eye(4, dtype=np.float32)*0.01
+        self.R = np.eye(2, dtype=np.float32)*0.1
+
+    def predict(self):
+        self.state = self.F @ self.state
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.H @ self.state  # 返回 [x, y]
+
+    def update(self, measurement):
+        # measurement: [x, y]
+        y = measurement - (self.H @ self.state)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state += K @ y
+        I = np.eye(4, dtype=np.float32)
+        self.P = (I - K @ self.H) @ self.P
+
+def forward_filter(measurements, kf):
+    """
+    measurements: list of (x,y)
+    返回:
+      fwd_states: [N,4]
+      fwd_covs  : [N,4,4]
+    """
+    fwd_states = []
+    fwd_covs   = []
+    x = kf.state.copy()
+    P = kf.P.copy()
+    
+    for z in measurements:
+        # predict
+        x = kf.F @ x
+        P = kf.F @ P @ kf.F.T + kf.Q
+        # update
+        y = z - (kf.H @ x)
+        S = kf.H @ P @ kf.H.T + kf.R
+        K = P @ kf.H.T @ np.linalg.inv(S)
+        x = x + K @ y
+        I = np.eye(4, dtype=np.float32)
+        P = (I - K @ kf.H) @ P
+        
+        fwd_states.append(x.copy())
+        fwd_covs.append(P.copy())
+    return fwd_states, fwd_covs
+
+def rts_smoother(fwd_states, fwd_covs, kf):
+    """
+    简易 RTS 回溯平滑
+    fwd_states, fwd_covs: 前向滤波结果
+    kf: KalmanFilter实例 (主要用F,Q)
+    """
+    N = len(fwd_states)
+    smooth_states = [None]*N
+    smooth_covs   = [None]*N
+    
+    smooth_states[-1] = fwd_states[-1].copy()
+    smooth_covs[-1]   = fwd_covs[-1].copy()
+    
+    for k in range(N-2, -1, -1):
+        xk  = fwd_states[k]
+        Pk  = fwd_covs[k]
+        xk1 = fwd_states[k+1]
+        Pk1 = fwd_covs[k+1]
+        
+        A = Pk @ kf.F.T @ np.linalg.inv(kf.F @ Pk @ kf.F.T + kf.Q)
+        smooth_states[k] = xk + A @ (smooth_states[k+1] - xk1)
+        smooth_covs[k]   = Pk + A @ (smooth_covs[k+1] - Pk1) @ A.T
+    
+    return smooth_states, smooth_covs
+
+class Track:
+    """
+    插入虚拟节点时使用
+    """
+    def __init__(self, track_id, init_pos, init_vel):
+        self.track_id = track_id
+        self.kf = KalmanFilter()
+        self.kf.state[:2] = init_pos
+        self.kf.state[2:] = init_vel
+
+    def update(self, pos):
+        self.kf.update(pos)
+
+    def predict(self):
+        return self.kf.predict()  # [x,y]
+
+    @property
+    def velocity(self):
+        return self.kf.state[2:4]
+
+def offline_smooth_track(measurements):
+    """
+    measurements: list of (x,y), len=N
+    返回 smooth_states [N,4]
+    """
+    # 1) 构造临时 KF
+    temp_kf = KalmanFilter()
+    # 2) forward
+    fwd_states, fwd_covs = forward_filter(measurements, temp_kf)
+    # 3) RTS
+    smooth_states, smooth_covs = rts_smoother(fwd_states, fwd_covs, temp_kf)
+    return smooth_states
+
+def smooth_all_tracks(pred_tracks):
+    """
+    pred_tracks: {tid: {frame: (x,y,w,h,is_v(可选),...)}}
+    => 返回 smoothed_tracks: {tid: {frame: (x_s,y_s,w,h,vx,vy,...) } }
+    """
+    smoothed_tracks = {}
+    for tid, frames_dict in pred_tracks.items():
+        if len(frames_dict)==0:
+            smoothed_tracks[tid] = {}
+            continue
+        
+        sorted_frames = sorted(frames_dict.keys())
+        # 收集 measurements
+        meas_list = []
+        for f in sorted_frames:
+            (x,y,w,h,*rest) = frames_dict[f]
+            meas_list.append((x,y))
+        
+        # 离线KF + RTS
+        smooth_states = offline_smooth_track(meas_list)
+        # smooth_states[i] => [x_s,y_s,vx_s,vy_s]
+        
+        # 合并回
+        out_dict = {}
+        for i, f in enumerate(sorted_frames):
+            (orig_x,orig_y, w,h,*rest) = frames_dict[f]
+            x_s = smooth_states[i][0]
+            y_s = smooth_states[i][1]
+            vx  = smooth_states[i][2]
+            vy  = smooth_states[i][3]
+            # is_virtual? (index 4?), 其余信息自选
+            is_v = False
+            if len(rest)>0 and isinstance(rest[0], bool):
+                is_v = rest[0]
+            out_dict[f] = (x_s, y_s, w, h, is_v, vx, vy)
+        smoothed_tracks[tid] = out_dict
+    return smoothed_tracks
+
+def solve_ilp_iterative(G, cells_by_t, optim_config):
+    import pulp
+    delta_p_max= optim_config.get('delta_p_max',20.0)
+    max_virtual= optim_config.get('max_virtual',5)
+    
+    max_iter= 10
+
+    def run_ilp_once(graph):
+        start_cost = optim_config.get('start_cost', 0.0)
+        end_cost = optim_config.get('end_cost', 0.0)
+        min_track_length = optim_config.get('min_track_length', None)
+        max_track_length = optim_config.get('max_track_length', None)
+        
+        # 引入参数: 轨迹密度阈值和最小位移阈值
+        density_threshold = optim_config.get('density_threshold', 0.5)
+        min_distance_threshold = optim_config.get('min_distance_threshold', 3.0)
+        problem= pulp.LpProblem("TrackForming", pulp.LpMaximize)
+        edges_var= {}
+        positions = {}
+        nodes = list(graph.nodes())
+        for (u,v) in graph.edges():
+            var_name= f"edge_{u}_{v}"
+            edges_var[(u,v)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
+
+        # 目标函数
+        problem += pulp.lpSum([edges_var[e]*graph.edges[e]['weight'] for e in edges_var])
+
+        # 入出度<=1
+        for nd in graph.nodes():
+            inc= [edges_var[(u,nd)] for u in graph.predecessors(nd) if (u,nd) in edges_var]
+            out=[edges_var[(nd,v)] for v in graph.successors(nd) if (nd,v) in edges_var]
+            problem += pulp.lpSum(inc) <=1
+            problem += pulp.lpSum(out)<=1
+
+        problem.solve()
+        if pulp.LpStatus[problem.status]!="Optimal":
+            return None
+
+        selected_edges=[]
+        for e,var in edges_var.items():
+            if var.varValue>0.5:
+                pos_u= graph.nodes[e[0]].get('pos', np.array([0,0,0,0]))
+                pos_v= graph.nodes[e[1]].get('pos', np.array([0,0,0,0]))
+                selected_edges.append((e[0], e[1], pos_u, pos_v))
+
+        # 构建轨迹(含edges)以进行密度检查
+        trajectories_with_edges = build_trajectories_with_edges(selected_edges)
+
+        filtered_edges = []
+        for traj_nodes, traj_positions, traj_edges in trajectories_with_edges:
+            # 轨迹密度计算
+            density = compute_track_density(traj_positions)
+            # 轨迹位移计算
+            total_displacement = np.linalg.norm(traj_positions[-1] - traj_positions[0])
+            # 轨迹密度与位移检查
+            if density <= density_threshold and total_displacement >= min_distance_threshold:
+                # 保留该轨迹的所有edges
+                filtered_edges.extend(traj_edges)
+            # else:
+                # 轨迹存在异常，需要进行局部修正（如分段剔除）
+                # 采用无效片段回溯（IFTB）策略
+                # valid_traj_edges = apply_invalid_fragment_backtracking(traj_nodes, traj_positions, traj_edges, density_threshold, min_distance_threshold)
+                # filtered_edges.extend(valid_traj_edges)
+        return filtered_edges
+
+    # 第一次ILP
+    solution_edges= run_ilp_once(G)
+    if solution_edges is None:
+        return None
+    return solution_edges
+
+    iteration=0
+    changed= True
+
+    while changed and iteration< max_iter:
+        iteration+=1
+        changed= False
+
+        partial_pred, _= parse_predictions(solution_edges)
+        # partial_pred: track_id -> {frame: (x,y,w,h)}
+
+        # 对每条轨迹 => KF => 逐帧 => 若下一帧无选中节点/超阈值 => 插虚拟节点 => changed= True
+        for t_id, frame_dict in partial_pred.items():
+            frames_sorted= sorted(frame_dict.keys())
+            if len(frames_sorted)<2:
+                continue
+
+            # 初始化 KF
+            first_f= frames_sorted[0]
+            x0,y0,w0,h0= frame_dict[first_f]
+            track_obj= Track(t_id, init_pos=np.array([x0,y0]), init_vel=np.array([0,0]),
+                             confidence=1.0, appearance=None)
+
+            consecutive_virtual= 0
+            for i in range(len(frames_sorted)-1):
+                f_cur= frames_sorted[i]
+                x_c,y_c,w_c,h_c= frame_dict[f_cur]
+                track_obj.update(np.array([x_c,y_c]))  # KF更新
+                pred= track_obj.predict()              # KF预测
+                f_next= frames_sorted[i+1]
+                
+                # 这里仅示意: 如果"f_cur -> f_next"无真实边 或者最小距离> delta_p_max, 
+                # 就在图里插"virtual节点"
+                # 需要更精准的判断. 
+                # 示例:
+                # 1) 在图G中找 (f_cur, any node in f_next) => 如果都没被选 => 
+                # 2) 计算pred与任何 f_next 真实节点最小距离> delta_p_max => => insert virtual
+                min_dist_to_any= 9999.0
+                next_nodes= [nd for nd in G.nodes() if nd[0]==f_next]
+                for nd in next_nodes:
+                    nd_pos= G.nodes[nd].get('pos', np.array([9999,9999]))
+                    dist= np.linalg.norm(nd_pos[:2] - pred)
+                    if dist< min_dist_to_any:
+                        min_dist_to_any= dist
+                if min_dist_to_any> delta_p_max:
+                    # 插虚拟节点
+                    virt_id= f"virtual_{t_id}_{f_next}_{consecutive_virtual}"
+                    node_v= (f_next, virt_id)
+                    G.add_node(node_v, pos=np.array([pred[0],pred[1],0,0]),
+                               velocity=np.array([0,0]), confidence=0.0)
+                    # 给低权重. 也可结合外观
+                    G.add_edge((f_cur, f"ilp_{t_id}"), node_v, weight=0.1)
+                    changed= True
+                    consecutive_virtual+=1
+                    if consecutive_virtual> max_virtual:
+                        break  # 超出允许的连续虚拟次数
+
+        if changed:
+            # 重新ILP
+            solution_edges= run_ilp_once(G)
+            if solution_edges is None:
+                return None
+        else:
+            break
+
+    return solution_edges
+
+
+import numpy as np
+from filterpy.kalman import KalmanFilter
+
+def convert_bbox_to_z(bbox):
+    """
+    bbox: [x1,y1,x2,y2]
+    output: [x, y, s, r]
+    """
+    x1,y1,x2,y2 = bbox
+    w = x2 - x1
+    h = y2 - y1
+    x_c = x1 + w/2.
+    y_c = y1 + h/2.
+    s = w*h
+    r = w/float(h+1e-6)
+    return np.array([x_c,y_c,s,r],dtype=np.float32).reshape((4,1))
+
+def convert_x_to_bbox(x):
+    """
+    x: [x, y, s, r]
+    return: [x1,y1,x2,y2]
+    """
+    x_c,y_c,s,r = x[0], x[1], x[2], x[3]
+    w = np.sqrt(s*r)
+    h = s/(w+1e-6)
+    x1 = x_c - w/2.
+    y1 = y_c - h/2.
+    x2 = x_c + w/2.
+    y2 = y_c + h/2.
+    return np.array([x1,y1,x2,y2],dtype=np.float32).reshape((4,))
+
+class KalmanBoxTracker:
+    """
+    类似 SORT 的卡尔曼滤波器
+    """
+    count = 0
+    def __init__(self, bbox):
+        # bbox: [x1,y1,x2,y2]
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        self.kf.F = np.array([[1,0,0,0,1,0,0],
+                              [0,1,0,0,0,1,0],
+                              [0,0,1,0,0,0,1],
+                              [0,0,0,1,0,0,0],
+                              [0,0,0,0,1,0,0],
+                              [0,0,0,0,0,1,0],
+                              [0,0,0,0,0,0,1]], dtype=np.float32)
+        self.kf.H = np.array([[1,0,0,0,0,0,0],
+                              [0,1,0,0,0,0,0],
+                              [0,0,1,0,0,0,0],
+                              [0,0,0,1,0,0,0]], dtype=np.float32)
+
+        self.kf.R[2:,2:] *= 10.
+        self.kf.P[4:,4:] *= 1000.
+        self.kf.P *= 10.
+        self.kf.Q[-1,-1] *= 0.01
+        self.kf.Q[4:,4:] *= 0.01
+
+        self.kf.x[:4] = convert_bbox_to_z(bbox)
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.age = 0
+
+    def predict(self):
+        if((self.kf.x[6] + self.kf.x[2]) <= 0):
+            self.kf.x[6] = 0.
+        self.kf.predict()
+        self.age += 1
+        self.time_since_update += 1
+        return convert_x_to_bbox(self.kf.x)
+
+    def update(self, bbox):
+        self.time_since_update = 0
+        z = convert_bbox_to_z(bbox)
+        self.kf.update(z)
+
+    def get_state(self):
+        """
+        返回当前预测框 [x1,y1,x2,y2]
+        """
+        return convert_x_to_bbox(self.kf.x)
+
+    def get_velocity(self):
+        """
+        这里假设 x[4], x[5] 近似 vx, vy (像素/帧), 
+        具体看F矩阵定义, 仅作演示.
+        """
+        vx = float(self.kf.x[4])
+        vy = float(self.kf.x[5])
+        return vx, vy
+
+def iou_1v1(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interW = max(0., xB - xA)
+    interH = max(0., yB - yA)
+    interArea = interW * interH
+    areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    union = areaA + areaB - interArea
+    return interArea / union if union>0 else 0.0
+
+def box_from_xywh(x, y, w, h):
+    x1 = x
+    y1 = y
+    x2 = x + w
+    y2 = y + h
+    return [x1,y1,x2,y2]
+
+def replay_track_with_kf(frames_map):
+    """
+    给定一条轨迹(按frame索引的字典: frame -> (x,y,w,h,is_v)),
+    从第一个帧到最后一个帧, 依次 predict->update,
+    返回 (kf_tracker, frames_map_out)
+
+    frames_map_out: {frame: (x,y,w,h,is_v, vx, vy)}
+      其中 x,y,w,h 可能被 KF 矫正, vx,vy 来源于 KF
+      也可只存 vx,vy, 不改 x,y,w,h, 灵活处理.
+    """
+    frames_sorted = sorted(frames_map.keys())
+    if not frames_sorted:
+        return None, {}
+
+    # 初始化
+    f1 = frames_sorted[0]
+    (x1,y1,w1,h1,isv1) = frames_map[f1]
+    box1 = box_from_xywh(x1,y1,w1,h1)
+    kf_tracker = KalmanBoxTracker(box1)
+
+    frames_map_out = {}
+    
+    # 第一个帧: 先predict(其实只改变 age ),再update
+    kf_tracker.predict()
+    kf_tracker.update(np.array(box1,dtype=np.float32))
+    vx, vy = kf_tracker.get_velocity()
+    # 这里我们是否要把KF矫正后的x,y,w,h写回? 视需求而定
+    x1_est, y1_est, x2_est, y2_est = kf_tracker.get_state()
+    w_est = x2_est - x1_est
+    h_est = y2_est - y1_est
+    frames_map_out[f1] = (x1_est, y1_est, w_est, h_est, isv1, vx, vy)
+
+    # 从第二帧开始
+    for f in frames_sorted[1:]:
+        (xx,yy,ww,hh,isv) = frames_map[f]
+        box_ = box_from_xywh(xx,yy,ww,hh)
+
+        pred_box = kf_tracker.predict()  # 预测
+        kf_tracker.update(np.array(box_, dtype=np.float32))  # 更新
+
+        vx, vy = kf_tracker.get_velocity()
+        x1_est, y1_est, x2_est, y2_est = kf_tracker.get_state()
+        w_est = x2_est - x1_est
+        h_est = y2_est - y1_est
+        frames_map_out[f] = (x1_est, y1_est, w_est, h_est, isv, vx, vy)
+
+    return kf_tracker, frames_map_out
+
+def insert_virtual_nodes(pred_tracks_initial,
+                         cells_by_t=None,  # unused, just keep signature
+                         optim_config=None):
+    """
+    在“已有ILP轨迹碎片”基础上, 用 SORT 风格的逐帧KF重放 + 末帧虚拟预测 + IOU拼接.
+
+    输入: 
+      pred_tracks_initial: {tid: {frame: (x,y,w,h,is_v)}}
+    输出:
+      pred_tracks:         {tid: {frame: (x,y,w,h,is_v, vx, vy)}}
+    """
+    if optim_config is None:
+        optim_config = {}
+    max_age = optim_config.get('max_virtual', 10)
+    iou_threshold = optim_config.get('iou_threshold', 0.3)
+
+    # 1) 先对所有轨迹做 "replay_track_with_kf"
+    #    => 让KF学到真实运动, 并输出 (vx,vy) 
+    pred_tracks = {}
+    kf_dict = {}  # 保存每条轨迹末尾的 KF (含最终速度)
+    for tid, frames_map in pred_tracks_initial.items():
+        kf_tracker, frames_map_out = replay_track_with_kf(frames_map)
+        pred_tracks[tid] = frames_map_out
+        kf_dict[tid] = kf_tracker  # 末帧对应的tracker
+
+    # 2) 拼接: 对每条轨迹, 从其末帧开始, 做虚拟预测, 看是否能连接别的轨迹
+    all_tids = sorted(pred_tracks.keys())
+    merged_set = set()
+
+    for tid in all_tids:
+        if tid in merged_set:
+            continue
+        frames_sorted = sorted(pred_tracks[tid].keys())
+        if not frames_sorted:
+            continue
+
+        # 取其最后一帧
+        end_frame = frames_sorted[-1]
+        # 这个KF已经在 replay过程中 更新到末帧的状态
+        kf_tracker = kf_dict[tid]
+        time_since_update = 0
+        cur_frame = end_frame
+
+        # 如果 ILP 已经把这轨迹和下一帧关联, 不需要虚拟预测
+        # 但如何判断? 
+        #   => 看 pred_tracks[tid] 是否还有 frame = end_frame+1
+        #   如果有的话, 说明没断. 
+        # 这里简单: 如果 (end_frame+1) 不在 frames_sorted, 说明断了, 要虚拟预测
+        while (cur_frame+1) not in frames_sorted and time_since_update <= max_age:
+            # step to next frame
+            cur_frame += 1
+            time_since_update += 1
+
+            # predict
+            pred_box = kf_tracker.predict()  # shape=(4,)
+            
+            # 在 cur_frame 中找 "起始帧==cur_frame" 的其它碎片
+            candidate_tids = []
+            for other_tid in all_tids:
+                if other_tid == tid or other_tid in merged_set:
+                    continue
+                frames2 = sorted(pred_tracks[other_tid].keys())
+                if not frames2:
+                    continue
+                if frames2[0] == cur_frame:
+                    candidate_tids.append(other_tid)
+
+            if len(candidate_tids)==0:
+                # 没有碎片在这帧开始 => 继续
+                if time_since_update>max_age:
+                    break
+                continue
+            
+            # 计算 IOU 
+            best_iou = 0.
+            best_tid2 = None
+            for t2 in candidate_tids:
+                frames2 = sorted(pred_tracks[t2].keys())
+                stf = frames2[0]
+                (xx, yy, ww, hh, isv2, vx2, vy2) = pred_tracks[t2][stf]
+                box2 = box_from_xywh(xx, yy, ww, hh)
+                iou_val = iou_1v1(pred_box, box2)
+                if iou_val>best_iou:
+                    best_iou = iou_val
+                    best_tid2 = t2
+            
+            if best_iou >= iou_threshold and best_tid2 is not None:
+                # update with that box
+                kf_tracker.update(np.array(box2, dtype=np.float32))
+
+                # 合并 best_tid2 整段
+                for f2 in sorted(pred_tracks[best_tid2].keys()):
+                    pred_tracks[tid][f2] = pred_tracks[best_tid2][f2]
+                merged_set.add(best_tid2)
+                # end
+                break
+            else:
+                # no match => next
+                if time_since_update>max_age:
+                    break
+
+    return pred_tracks
+
+
+def rebuild_frame_tracks_from_pred_tracks(pred_tracks):
+    """
+    pred_tracks: {tid: {frame: (x,y,w,h,is_v[, vx,vy,...])}}
+    => 返回 frame_tracks: {frame: [(tid, x,y,w,h,is_v[, vx,vy,...])]}
+
+    如果后续写文件只需 tid, x,y,w,h,isv,可将 vx,vy 等保留在 track tuple 里看需求。
+    """
+    frame_tracks = {}
+    for tid, frames_dict in pred_tracks.items():
+        for fr, box in frames_dict.items():
+            # box 至少5个维度: (x,y,w,h,is_v), 可能≥7 (vx,vy)
+            if len(box) < 5:
+                # 如果不足5 => 视为 (x,y,w,h)? => 补 is_v=False
+                x, y, w, h = box[:4]
+                is_v = False
+                # vx, vy = 0,0  (可选)
+                new_track_tuple = (tid, x, y, w, h, is_v)
+            else:
+                # 取前5个
+                x, y, w, h, is_v = box[:5]
+                # 如果还存在 vx, vy => box[5], box[6]
+                vx, vy = 0.0, 0.0
+                if len(box) >= 7:
+                    vx, vy = box[5], box[6]
+                # 可以选择保留
+                # new_track_tuple = (tid, x, y, w, h, is_v, vx, vy)
+                # 如果写文件只要6个 => (tid,x,y,w,h,is_v)
+                new_track_tuple = (tid, x, y, w, h, is_v)
+            
+            if fr not in frame_tracks:
+                frame_tracks[fr] = []
+            frame_tracks[fr].append(new_track_tuple)
+    
+    return frame_tracks
+
+
+def solve_ilp_initial(G):
+    """
+    初始ILP求解，仅基于真实节点的图
+    """
+    problem = pulp.LpProblem("InitialTrackForming", pulp.LpMaximize)
+    edges_var = {}
+    for (u, v) in G.edges():
+        var_name = f"edge_{u}_{v}"
+        edges_var[(u, v)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
+
+    # 目标函数: 最大化所有边的权重之和
+    problem += pulp.lpSum([edges_var[e] * G.edges[e]['weight'] for e in edges_var])
+
+    # 入度和出度约束: 每个节点的入度和出度均不超过1
+    for node in G.nodes():
+        incoming = [edges_var[(u, node)] for u in G.predecessors(node) if (u, node) in edges_var]
+        outgoing = [edges_var[(node, v)] for v in G.successors(node) if (node, v) in edges_var]
+        problem += pulp.lpSum(incoming) <= 1, f"MaxIn_{node}"
+        problem += pulp.lpSum(outgoing) <= 1, f"MaxOut_{node}"
+
+    # 求解ILP
+    problem.solve()
+
+    if pulp.LpStatus[problem.status] != "Optimal":
+        return None
+
+    # 提取选中的边
+    selected_edges = []
+    for (u, v), var in edges_var.items():
+        if var.varValue > 0.5:
+            pos_u = G.nodes[u]['pos']
+            pos_v = G.nodes[v]['pos']
+            selected_edges.append((u, v, pos_u, pos_v))
+    return selected_edges
+
+###############################################################################
+# 9) 最终ILP求解函数 (包含虚拟节点)
+###############################################################################
+def solve_ilp_final(G, optim_config):
+    """
+    最终ILP求解，包含虚拟节点的图
+    """
+    density_threshold = optim_config.get('density_threshold', 0.45)
+    min_distance_threshold = optim_config.get('min_distance_threshold', 2)
+    problem = pulp.LpProblem("FinalTrackForming", pulp.LpMaximize)
+    edges_var = {}
+    for (u, v) in G.edges():
+        var_name = f"edge_{u}_{v}"
+        edges_var[(u, v)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
+
+    # 目标函数: 最大化所有边的权重之和
+    problem += pulp.lpSum([edges_var[e] * G.edges[e]['weight'] for e in edges_var])
+
+    # 入度和出度约束: 每个节点的入度和出度均不超过1
+    for node in G.nodes():
+        incoming = [edges_var[(u, node)] for u in G.predecessors(node) if (u, node) in edges_var]
+        outgoing = [edges_var[(node, v)] for v in G.successors(node) if (node, v) in edges_var]
+        problem += pulp.lpSum(incoming) <= 1, f"MaxIn_{node}"
+        problem += pulp.lpSum(outgoing) <= 1, f"MaxOut_{node}"
+
+    # 求解ILP
+    problem.solve()
+
+    if pulp.LpStatus[problem.status] != "Optimal":
+        return None
+
+    # 提取选中的边
+    selected_edges = []
+    for (u, v), var in edges_var.items():
+        if var.varValue > 0.5:
+            pos_u = G.nodes[u]['pos']
+            pos_v = G.nodes[v]['pos']
+            selected_edges.append((u, v, pos_u, pos_v))
+
+    # 构建轨迹(含edges)以进行密度检查
+    trajectories_with_edges = build_trajectories_with_edges(selected_edges)
+
+    filtered_edges = []
+    for traj_nodes, traj_positions, traj_edges in trajectories_with_edges:
+        # 轨迹密度计算
+        density = compute_track_density(traj_positions)
+        # 轨迹位移计算
+        total_displacement = np.linalg.norm(traj_positions[-1] - traj_positions[0])
+        # 轨迹密度与位移检查
+        if density <= density_threshold and total_displacement >= min_distance_threshold:
+            # 保留该轨迹的所有edges
+            filtered_edges.extend(traj_edges)
+
+    return selected_edges
+
+def create_graph(cells_by_t, optim_config):
+    import networkx as nx
+    import numpy as np
+    from scipy.spatial import KDTree
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    G = nx.DiGraph()
+    
+    # 从优化配置中获取参数
+    max_children = optim_config.get('max_children', 3)
+    distance_threshold = optim_config.get('distance_threshold', 10)
+    confidence_threshold = optim_config.get('confidence_threshold', 0.3)
+    confidence_function = optim_config.get('confidence_function', 'quadratic')
+    weight_position = optim_config.get('weight_position', 1.0)
+    weight_velocity = optim_config.get('weight_velocity', 1.0)
+    weight_appearance = optim_config.get('weight_appearance', 1.0)
+    epsilon = 1
+    gaussian_sigma = optim_config.get('gaussian_sigma', 1.0)
+
+    # 只考虑相邻帧
+    time_window = 1
+
+    # 添加节点
+    for t in cells_by_t:
+        for cell in cells_by_t[t]:
+            if len(cell) == 5:
+                cell_id, position, velocity, confidence, appearance = cell
+            elif len(cell) == 4:
+                cell_id, position, velocity, confidence = cell
+                appearance = None
+            else:
+                cell_id, position, velocity = cell[:3]
+                confidence = 1.0
+                appearance = None
+            if confidence < confidence_threshold:
+                continue
+            G.add_node((t, cell_id), pos=position, velocity=velocity, confidence=confidence, appearance=appearance)
+    
+    # 添加边(相邻帧)
+    frames = sorted(cells_by_t.keys())
+    from scipy.spatial import KDTree
+    for idx, t in enumerate(frames):
+        t_next = t + 1
+        if t_next in cells_by_t:
+            current_frame = [cell for cell in cells_by_t[t] if cell[3] >= confidence_threshold]
+            next_frame = [cell for cell in cells_by_t[t_next] if cell[3] >= confidence_threshold]
+
+            next_positions = [cell[1][:2] for cell in next_frame]
+            next_ids = [cell[0] for cell in next_frame]
+            next_velocities = [cell[2] for cell in next_frame]
+            next_confidences = [cell[3] for cell in next_frame]
+            next_appearances = [cell[4] if len(cell) > 4 else None for cell in next_frame]
+
+            if next_positions:
+                kd_tree = KDTree(next_positions)
+
+                for current_cell in current_frame:
+                    current_id = current_cell[0]
+                    current_pos = current_cell[1][:2]
+                    current_vel = current_cell[2]
+                    current_conf = current_cell[3]
+                    current_app = current_cell[4] if len(current_cell) > 4 else None
+
+                    distances, indices = kd_tree.query(current_pos, k=max_children)
+                    if not isinstance(distances, np.ndarray):
+                        distances = [distances]
+                        indices = [indices]
+
+                    for distance, index in zip(distances, indices):
+                        if distance < distance_threshold:
+                            next_id = next_ids[index]
+                            next_pos = next_positions[index]
+                            next_vel_val = next_velocities[index]
+                            next_conf_val = next_confidences[index]
+                            next_app_val = next_appearances[index]
+
+                            delta_p = np.linalg.norm(np.array(next_pos) - np.array(current_pos))
+                            if gaussian_sigma == 0:
+                                sim_p = 1 / (delta_p + epsilon)
+                            else:
+                                sim_p = np.exp(- (delta_p ** 2) / (2 * gaussian_sigma ** 2))
+
+                            delta_v = np.linalg.norm(next_vel_val - current_vel)
+                            if gaussian_sigma == 0:
+                                sim_v = 1 / (delta_v + epsilon)
+                            else:
+                                sim_v = np.exp(- (delta_v ** 2) / (2 * gaussian_sigma ** 2))
+
+                            if weight_appearance > 0 and current_app is not None and next_app_val is not None:
+                                sim_app = cosine_similarity([current_app.cpu().numpy()], [next_app_val.cpu().numpy()])[0][0]
+                            else:
+                                sim_app = 0.0
+
+                            if confidence_function == 'linear':
+                                w_conf = current_conf * next_conf_val
+                            elif confidence_function == 'quadratic':
+                                w_conf = (current_conf * next_conf_val) ** 2
+                            else:
+                                w_conf = 1.0
+
+                            weight = w_conf * (weight_position * sim_p + weight_velocity * sim_v + weight_appearance * sim_app)
+                            G.add_edge((t, current_id), (t_next, next_id), weight=weight)
+    return G
+
+def solve_ilp(graph, optim_config):
+    import pulp
+    import numpy as np
+
+    start_cost = optim_config.get('start_cost', 0.0)
+    end_cost = optim_config.get('end_cost', 0.0)
+    min_track_length = optim_config.get('min_track_length', None)
+    max_track_length = optim_config.get('max_track_length', None)
+
+    density_threshold = optim_config.get('density_threshold', 0.5)
+    min_distance_threshold = optim_config.get('min_distance_threshold', 3.0)
+
+    problem = pulp.LpProblem("TrackForming", pulp.LpMaximize)
+
+    edges = {}
+    positions = {}
+    nodes = list(graph.nodes())
+
+    for u, v in graph.edges():
+        var_name = f"edge_{u}_{v}"
+        edges[(u, v)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
+        positions[u] = graph.nodes[u]['pos']
+        positions[v] = graph.nodes[v]['pos']
+
+    if start_cost > 0 or end_cost > 0:
+        start_node = 'Start'
+        end_node = 'End'
+        graph.add_node(start_node)
+        graph.add_node(end_node)
+        for node in nodes:
+            var_start = f"edge_{start_node}_{node}"
+            var_end = f"edge_{node}_{end_node}"
+            edges[(start_node, node)] = pulp.LpVariable(var_start, cat=pulp.LpBinary)
+            edges[(node, end_node)] = pulp.LpVariable(var_end, cat=pulp.LpBinary)
+            graph.add_edge(start_node, node, weight=start_cost)
+            graph.add_edge(node, end_node, weight=end_cost)
+
+    problem += pulp.lpSum(edges[e] * graph.edges[e]['weight'] for e in edges)
+
+    # 入出度限制
+    for node in nodes:
+        incoming_edges = [edges[(u, node)] for u in graph.predecessors(node) if (u, node) in edges]
+        outgoing_edges = [edges[(node, v)] for v in graph.successors(node) if (node, v) in edges]
+        problem += pulp.lpSum(incoming_edges) <= 1, f"MaxIn_{node}"
+        problem += pulp.lpSum(outgoing_edges) <= 1, f"MaxOut_{node}"
+
+    if min_track_length is not None or max_track_length is not None:
+        track_vars = {}
+        track_id = 0
+
+        def add_track_length_constraints(current_node, current_length):
+            outgoing_edges = [edges[(current_node, v)] for v in graph.successors(current_node) if (current_node, v) in edges]
+            problem += track_var >= current_length, f"TrackLength_{current_node}"
+            for edge_var, successor_node in zip(outgoing_edges, graph.successors(current_node)):
+                problem += edge_var <= track_var, f"EdgeTrack_{current_node}_{successor_node}"
+                add_track_length_constraints(successor_node, current_length + 1)
+
+        for node in nodes:
+            incoming_edges = [edges[(u, node)] for u in graph.predecessors(node) if (u, node) in edges]
+            if len(incoming_edges) == 0:
+                track_var = pulp.LpVariable(f"Track_{track_id}", lowBound=0, cat=pulp.LpInteger)
+                track_id += 1
+                add_track_length_constraints(node, 1)
+                if min_track_length is not None:
+                    problem += track_var >= min_track_length, f"MinTrackLength_{node}"
+                if max_track_length is not None:
+                    problem += track_var <= max_track_length, f"MaxTrackLength_{node}"
+
+    problem.solve()
+
+    if pulp.LpStatus[problem.status] == "Optimal":
+        # solution_edges: list of (u,v,pos_u,pos_v)
+        selected_edges = [
+            (u, v, positions[u], positions[v])
+            for u, v in edges
+            if edges[(u, v)].varValue > 0.5 and u in positions and v in positions
+            if u != 'Start' and v != 'End'
+        ]
+
+        # 构建轨迹(含edges)以进行密度检查
+        trajectories_with_edges = build_trajectories_with_edges(selected_edges)
+
+        filtered_edges = []
+        for traj_nodes, traj_positions, traj_edges in trajectories_with_edges:
+            density = compute_track_density(traj_positions)
+            total_displacement = np.linalg.norm(traj_positions[-1] - traj_positions[0])
+            if density <= density_threshold and total_displacement >= min_distance_threshold:
+                # 保留该轨迹的所有edges
+                filtered_edges.extend(traj_edges)
+
+        return filtered_edges
+    else:
+        return None
+
+def parse_predictions(solution_edges):
+    """
+    根据选中的边解析轨迹
+    返回: pred_tracks (track_id -> {frame: (x, y, w, h)}),
+           frame_tracks (frame -> list of (track_id, x, y, w, h))
+    """
+    node_succ = {}
+    node_pred = {}
+    node_pos = {}
+    for u, v, posu, posv in solution_edges:
+        node_succ[u] = v
+        node_pred[v] = u
+        node_pos[u] = posu
+        node_pos[v] = posv
+
+    # 找起始节点（无前驱）
+    all_nodes = set(node_succ.keys()).union(set(node_succ.values()))
+    start_nodes = [nd for nd in all_nodes if nd not in node_pred]
+
+    pred_tracks = {}
+    frame_tracks = {}
+    track_id = 0
+    visited = set()
+
+    for st in start_nodes:
+        if st in visited:
+            continue
+        tid = track_id
+        track_id += 1
+        pred_tracks[tid] = {}
+        node = st
+        while node in node_succ:
+            if node in visited:
+                break
+            visited.add(node)
+            if node in node_pos:
+                fr, cell_id = node
+                px, py, w, h = node_pos[node]
+                pred_tracks[tid][fr] = (px, py, w, h)
+                if fr not in frame_tracks:
+                    frame_tracks[fr] = []
+                frame_tracks[fr].append((tid, px, py, w, h))
+            node = node_succ[node]
+        # 末尾节点
+        if node not in visited and node in node_pos:
+            visited.add(node)
+            fr, cell_id = node
+            px, py, w, h = node_pos[node]
+            pred_tracks[tid][fr] = (px, py, w, h)
+            if fr not in frame_tracks:
+                frame_tracks[fr] = []
+            frame_tracks[fr].append((tid, px, py, w, h))
+
+    return pred_tracks, frame_tracks
+
+def parse_prediction(solution_edges):
+    """ Parses the solution edges to create tracks with consistent IDs."""
+    # 建立节点的前驱和后继映射
+    node_successors = {}
+    node_predecessors = {}
+    nodes = set()
+    node_centers = {}
+    for u, v, pos_u, pos_v in solution_edges:
+        node_successors[u] = v
+        node_predecessors[v] = u
+        nodes.add(u)
+        nodes.add(v)
+        node_centers[u] = pos_u
+        node_centers[v] = pos_v
+
+    # 查找起始节点（没有前驱的节点）
+    start_nodes = [node for node in nodes if node not in node_predecessors]
+
+    pred_tracks = {}
+    frame_tracks = {}
+    track_id_counter = 0
+    visited_nodes = set()
+
+    # 遍历每个起始节点，构建轨迹
+    for start_node in start_nodes:
+        node = start_node
+        track_id = track_id_counter
+        track_id_counter += 1
+        while True:
+            if node in visited_nodes:
+                break
+            visited_nodes.add(node)
+            frame_id, cell_id = node
+            center = node_centers.get(node)
+            if center is None:
+                break
+            # 转换为左上角坐标
+            tl_x = center[0] - center[2] / 2
+            tl_y = center[1] - center[3] / 2
+            # 更新 pred_tracks
+            if track_id not in pred_tracks:
+                pred_tracks[track_id] = {}
+            pred_tracks[track_id][frame_id] = (tl_x, tl_y, center[2], center[3], False)
+            # 更新 frame_tracks
+            if frame_id not in frame_tracks:
+                frame_tracks[frame_id] = []
+            frame_tracks[frame_id].append((track_id, tl_x, tl_y, center[2], center[3], False))
+            # 移动到下一个节点
+            if node in node_successors:
+                node = node_successors[node]
+            else:
+                break
+    return pred_tracks, frame_tracks
+
+def create_graph_online(curr_frame_detections, next_frame_detections,
+                        tracker, optim_config,
+                        curr_frame_num, next_frame_num):
+    """
+    针对相邻帧 "curr_frame" & "next_frame" 只构建这两帧的小图
+    并将KF + motion场结合计算关联得分
+    """
+    G = nx.DiGraph()
+    delta_p_max = optim_config.get('delta_p_max', 20.0)
+    distance_threshold = optim_config.get('distance_threshold', 10)
+    conf_thresh = optim_config.get('confidence_threshold', 0.3)
+    confidence_function = optim_config.get('confidence_function', 'linear')
+    weight_position = optim_config.get('weight_position', 1.0)
+    weight_velocity = optim_config.get('weight_velocity', 1.0)
+    weight_appearance = optim_config.get('weight_appearance', 1.0)
+    epsilon = optim_config.get('epsilon', 1e-5)
+    gaussian_sigma = optim_config.get('gaussian_sigma', 1.0)
+    max_children = optim_config.get('max_children', 3)
+
+    # 下一帧节点
+    next_positions = []
+    next_ids = []
+    next_vels = []
+    next_confs = []
+    next_apps = []
+
+    for c in next_frame_detections:
+        if c[3] < conf_thresh:
+            continue
+        c_id, c_pos, c_vel, c_conf, c_app = c
+        G.add_node((next_frame_num, c_id), pos=c_pos, velocity=c_vel,
+                   confidence=c_conf, appearance=c_app)
+        next_positions.append(c_pos[:2])
+        next_ids.append(c_id)
+        next_vels.append(c_vel)
+        next_confs.append(c_conf)
+        next_apps.append(c_app)
+
+    kd_tree = KDTree(next_positions) if len(next_positions) > 0 else None
+
+    # KF预测
+    preds = {}
+    for tr in tracker.tracks:
+        preds[tr.track_id] = tr.predict()
+
+    if kd_tree:
+        for tr in tracker.tracks:
+            pred_pos = preds[tr.track_id]
+            dists, idxs = kd_tree.query(pred_pos, k=max_children)
+            if not isinstance(dists, np.ndarray):
+                dists = [dists]
+                idxs = [idxs]
+            min_d = np.min(dists)
+            for dist, idxn in zip(dists, idxs):
+                if dist < distance_threshold:
+                    nxt_id = next_ids[idxn]
+                    nxt_pos = next_positions[idxn]
+                    nxt_vel = next_vels[idxn]
+                    nxt_conf = next_confs[idxn]
+                    nxt_app = next_apps[idxn]
+
+                    # 位置相似度
+                    delta_p = np.linalg.norm(nxt_pos - pred_pos)
+                    if gaussian_sigma == 0:
+                        sim_p = 1 / (delta_p + epsilon)
+                    else:
+                        sim_p = np.exp(-(delta_p ** 2) / (2 * gaussian_sigma ** 2))
+
+                    # 速度相似度
+                    pred_v = tr.kf.state[2:]
+                    dv = np.linalg.norm(nxt_vel - pred_v)
+                    if gaussian_sigma == 0:
+                        sim_v = 1 / (dv + epsilon)
+                    else:
+                        sim_v = np.exp(-(dv ** 2) / (2 * gaussian_sigma ** 2))
+
+                    # 外观相似度
+                    if tr.app is not None and nxt_app is not None:
+                        sim_app = cosine_similarity([tr.app.cpu().numpy()],
+                                                   [nxt_app.cpu().numpy()])[0][0]
+                    else:
+                        sim_app = 0.0
+
+                    # 置信度
+                    if confidence_function == 'linear':
+                        w_conf = tr.conf * nxt_conf
+                    elif confidence_function == 'quadratic':
+                        w_conf = (tr.conf * nxt_conf) ** 2
+                    else:
+                        w_conf = 1.0
+
+                    weight = w_conf * (weight_position * sim_p + weight_velocity * sim_v + weight_appearance * sim_app)
+                    # 加边
+                    G.add_edge((curr_frame_num, tr.track_id), (next_frame_num, nxt_id),
+                               weight=weight)
+
+            if min_d > delta_p_max:
+                # 虚拟节点
+                v_id = f"virtual_{tr.track_id}"
+                # pos= pred_pos + [w, h]
+                virtual_pos = np.array([tr.kf.state[0], tr.kf.state[1], tr.w, tr.h])
+                G.add_node((next_frame_num, v_id), pos=virtual_pos,
+                           velocity=tr.kf.state[2:], confidence=1.0, appearance=None)
+                G.add_edge((curr_frame_num, tr.track_id), (next_frame_num, v_id), weight=0.1)
+    else:
+        # 若 next_positions 为空 => 全虚拟
+        for tr in tracker.tracks:
+            v_id = f"virtual_{tr.track_id}"
+            G.add_node((next_frame_num, v_id), pos=np.array([tr.kf.state[0], tr.kf.state[1], tr.w, tr.h]),
+                       velocity=tr.kf.state[2:], confidence=1.0, appearance=None)
+            G.add_edge((curr_frame_num, tr.track_id), (next_frame_num, v_id), weight=0.1)
+
+    # 为当前帧的轨迹节点加到图中
+    for tr in tracker.tracks:
+        G.add_node((curr_frame_num, tr.track_id), pos=[tr.kf.state[0], tr.kf.state[1], tr.w, tr.h], velocity=tr.kf.state[2:], 
+                   confidence=tr.conf, appearance=tr.app)
+
+    return G
+
+def solve_ilp_online(graph, optim_config):
+    """
+    针对在线逐帧的小图，求解ILP以决定关联关系。
+    """
+    problem = pulp.LpProblem("TrackOnline", pulp.LpMaximize)
+    edges = {}
+    for (u, v) in graph.edges():
+        var_name = f"edge_{u}_{v}"
+        edges[(u, v)] = pulp.LpVariable(var_name, cat=pulp.LpBinary)
+
+    # 目标函数：最大化边权重之和
+    problem += pulp.lpSum(edges[e] * graph.edges[e]['weight'] for e in edges)
+
+    # 入度和出度限制：每个节点最多有一个入边和一个出边
+    for nd in graph.nodes():
+        incoming = [edges[(u, nd)] for u in graph.predecessors(nd) if (u, nd) in edges]
+        outgoing = [edges[(nd, v)] for v in graph.successors(nd) if (nd, v) in edges]
+        problem += pulp.lpSum(incoming) <= 1, f"MaxIn_{nd}"
+        problem += pulp.lpSum(outgoing) <= 1, f"MaxOut_{nd}"
+
+    # 轨迹长度限制（可选）
+    min_track_length = optim_config.get('min_track_length', None)
+    max_track_length = optim_config.get('max_track_length', None)
+    # 由于是逐帧处理，轨迹长度限制在此场景下较为复杂，暂不实现
+    # 若需要，可在后处理阶段进行过滤
+
+    # 求解ILP
+    problem.solve()
+
+    if pulp.LpStatus[problem.status] == "Optimal":
+        # solution_edges: list of (u,v,pos_u,pos_v)
+        selected_edges = [
+            (u, v, graph.nodes[u]['pos'], graph.nodes[v]['pos'])
+            for u, v in edges
+            if edges[(u, v)].varValue > 0.5 and u in graph.nodes and v in graph.nodes
+            if u[0] != 'Start' and v[0] != 'End'
+        ]
+
+        return selected_edges
+    else:
+        return None
+
+
+def build_trajectories_with_edges(selected_edges):
+    """
+    返回一个列表，每个元素为 (traj_nodes, traj_positions, traj_edges)
+    traj_nodes: 轨迹节点序列 (u,v,...)
+    traj_positions: 与traj_nodes对应的position序列的np.array(L, 2)
+    traj_edges: 构成该轨迹的边列表[(u,v,pos_u,pos_v), ...]
+    """
+    from collections import defaultdict
+    import numpy as np
+
+    graph_dict = defaultdict(list)
+    nodes_set = set()
+
+    # 构建图结构
+    for u, v, pos_u, pos_v in selected_edges:
+        graph_dict[u].append((v, pos_u, pos_v))
+        nodes_set.add(u)
+        nodes_set.add(v)
+
+    # 入度统计
+    in_degree = {n:0 for n in nodes_set}
+    for u in graph_dict:
+        for (vv, pos_u, pos_v) in graph_dict[u]:
+            in_degree[vv] += 1
+    start_nodes = [n for n in nodes_set if in_degree[n] == 0]
+
+    trajectories = []
+    for start in start_nodes:
+        # 重建轨迹:从start出发
+        # 找到start点pos: 使用graph_dict[start]的第一条边的pos_u作为起始点
+        traj_nodes = [start]
+        traj_positions = []
+        traj_edges = []
+
+        if start in graph_dict and len(graph_dict[start]) > 0:
+            # 使用第一条边的 pos_u 作为起始点位置
+            first_edge = graph_dict[start][0]
+            pos_start = first_edge[1]
+            traj_positions.append(pos_start)
+        else:
+            # 如果start没有后继边，找到start的pos
+            pos_start = None
+            for (uu, vv, pu, pv) in selected_edges:
+                if uu == start:
+                    pos_start = pu
+                    break
+                if vv == start:
+                    pos_start = pv
+                    break
+            if pos_start is None:
+                # 无法找到start点pos,跳过
+                continue
+            traj_positions.append(pos_start)
+
+        current = start
+        while current in graph_dict and len(graph_dict[current]) == 1:
+            next_node, pos_u, pos_v = graph_dict[current][0]
+            traj_nodes.append(next_node)
+            traj_positions.append(pos_v)
+            traj_edges.append((current, next_node, pos_u, pos_v))
+            current = next_node
+
+        trajectories.append((traj_nodes, np.array(traj_positions), traj_edges))
+
+    return trajectories
+
+
+def compute_track_density(traj_positions):
+    """
+    计算轨迹密度
+    traj_positions: numpy数组，形状为 (L, 2)
+    """
+    import numpy as np
+    L = len(traj_positions)
+    if L < 2:
+        # 如果轨迹太短，没有后续点，就不视为异常
+        return 0.0
+
+    p_t = traj_positions[0]
+    total_N = 0
+    denominator = 0
+    # k从1到L-1
+    for k in range(1, L):
+        p_tk = traj_positions[k]
+        R_tk = np.linalg.norm(p_tk - p_t)
+        # 在 {p_k, p_{k+1}, ..., p_{L-1}} 中统计位于半径 R_tk 内的点数 N_{t+k}
+        sub_points = traj_positions[k:]  # k到末尾的点
+        count_abnormal = np.sum(np.linalg.norm(sub_points - p_t, axis=1) <= R_tk)
+        total_N += count_abnormal
+        denominator += (L - k)  # (L-k)为剩余点数量
+
+    if denominator == 0:
+        return 0.0
+    density = total_N / denominator
+    return density
+
+
+def apply_invalid_fragment_backtracking(traj_nodes, traj_positions, traj_edges, density_threshold, min_distance_threshold):
+    """
+    对存在异常的轨迹进行局部修正，剔除无效片段
+    traj_nodes: 轨迹节点序列 (u,v,...)
+    traj_positions: 与traj_nodes对应的position序列的np.array(L, 2)
+    traj_edges: 构成该轨迹的边列表[(u,v,pos_u,pos_v), ...]
+    返回修正后的有效轨迹边列表
+    """
+    import numpy as np
+
+    L = len(traj_positions)
+    if L < 2:
+        return []
+
+    # 逐步检查轨迹密度，从前到后
+    valid_traj_edges = []
+    current_traj_nodes = []
+    current_traj_positions = []
+    current_traj_edges = []
+
+    for i in range(L):
+        # 构建当前子轨迹
+        current_traj_nodes.append(traj_nodes[i])
+        current_traj_positions = traj_positions[:i+1]
+        if i < L -1:
+            edge = traj_edges[i]
+            current_traj_edges.append(edge)
+
+        if len(current_traj_positions) >= 2:
+            density = compute_track_density(current_traj_positions)
+            displacement = np.linalg.norm(current_traj_positions[-1] - current_traj_positions[0])
+            if density > density_threshold or displacement < min_distance_threshold:
+                # 异常点出现，进行回溯剔除
+                # 保留当前轨迹到上一个有效点
+                if i > 0:
+                    # 保留前i个点
+                    valid_traj_edges.extend(current_traj_edges[:-1])
+                # 重置当前轨迹
+                current_traj_nodes = [traj_nodes[i]]
+                current_traj_positions = traj_positions[i:i+1]
+                current_traj_edges = []
+        else:
+            # 轨迹长度不足2，不进行密度检查
+            pass
+
+    # 最后保留剩余的有效轨迹
+    if len(current_traj_positions) >= 2:
+        density = compute_track_density(current_traj_positions)
+        displacement = np.linalg.norm(current_traj_positions[-1] - current_traj_positions[0])
+        if density <= density_threshold and displacement >= min_distance_threshold:
+            valid_traj_edges.extend(current_traj_edges)
+
+    return valid_traj_edges
+
+# def build_videos_cells_by_t(res, area_percentage=10):
+#     import os
+#     import numpy as np
+
+#     videos_cells_by_t = {}  # 存储每个视频的 cells_by_t
+#     tid_counters = {}       # 存储每个视频的全局目标ID计数器
+#     for image_path, detections_dict in res.items():
+#         # 提取视频名称和帧编号
+#         # 假设图像路径格式为 './data/viso/test/001/img1/000001.jpg'
+#         path_parts = image_path.split('/')
+#         try:
+#             test_index = path_parts.index('test')
+#             video_name = path_parts[test_index + 1]  # 获取视频名称，例如 '001'
+#         except ValueError:
+#             print(f"无法在路径中找到 'test'：{image_path}")
+#             continue
+
+#         # 初始化视频的 cells_by_t 和 tid_counter
+#         if video_name not in videos_cells_by_t:
+#             videos_cells_by_t[video_name] = {}
+#             tid_counters[video_name] = 0  # 初始化目标ID计数器
+
+#         cells_by_t = videos_cells_by_t[video_name]
+#         tid_counter = tid_counters[video_name]
+
+#         # 提取帧编号
+#         image_name = os.path.basename(image_path)          # 获取文件名，例如 '000001.jpg'
+#         frame_number_str = os.path.splitext(image_name)[0] # 提取帧编号字符串，例如 '000001'
+#         frame_number = int(frame_number_str)               # 转换为整数
+
+#         # 处理每个检测框
+#         boxes = detections_dict[1]  # 获取检测框
+#         features = detections_dict['f1']  # 获取外观特征
+#         for i, (box, feature) in enumerate(zip(boxes, features)):
+#             # detections_array 的形状为 [N, 5]，其中 N 为检测框数量
+            
+#                 x_min, y_min, x_max, y_max, confidence = box
+#                 appearence = feature
+#                 # **添加置信度过滤**
+#                 if confidence < 0.3:
+#                     continue  # 跳过低置信度的检测
+
+#                 # 计算中心点坐标、宽度和高度
+#                 x_center = (x_min + x_max) / 2.0
+#                 y_center = (y_min + y_max) / 2.0
+#                 w = x_max - x_min
+#                 h = y_max - y_min
+
+#                 # 构建光流文件路径
+#                 # 光流路径格式为 './data/viso/test/001/flow/000001.npy'
+#                 flow_dir = os.path.join(*path_parts[:test_index + 2], 'flow')  # 构建 flow 文件夹路径
+#                 flow_path = os.path.join(flow_dir, frame_number_str + '.npy')  # 构建光流文件路径
+
+#                 # 检查光流文件是否存在
+#                 if os.path.exists(flow_path):
+#                     flow_map = np.load(flow_path)  # 加载光流图，形状为 [2, H, W]
+#                     flow_channels, flow_h, flow_w = flow_map.shape
+
+#                     # 计算选取区域的大小
+#                     area_ratio = area_percentage / 100.0  # 将百分比转换为小数
+#                     # 计算选取区域的宽度和高度
+#                     region_w = w * np.sqrt(area_ratio)
+#                     region_h = h * np.sqrt(area_ratio)
+
+#                     # 确定区域的边界，不超过目标框
+#                     region_x_min = max(int(x_center - region_w / 2), int(x_min))
+#                     region_y_min = max(int(y_center - region_h / 2), int(y_min))
+#                     region_x_max = min(int(x_center + region_w / 2), int(x_max))
+#                     region_y_max = min(int(y_center + region_h / 2), int(y_max))
+
+#                     # 确保边界在图像范围内
+#                     region_x_min = np.clip(region_x_min, 0, flow_w - 1)
+#                     region_y_min = np.clip(region_y_min, 0, flow_h - 1)
+#                     region_x_max = np.clip(region_x_max, 0, flow_w - 1)
+#                     region_y_max = np.clip(region_y_max, 0, flow_h - 1)
+
+#                     # 提取选定区域的光流
+#                     flow_region = flow_map[:, region_y_min:region_y_max + 1, region_x_min:region_x_max + 1]
+#                     # 计算区域内的平均光流
+#                     flow_x = np.mean(flow_region[0])
+#                     flow_y = np.mean(flow_region[1])
+#                 else:
+#                     # 若光流文件不存在（如最后一帧），速度设为 0
+#                     flow_x = 0.0
+#                     flow_y = 0.0
+
+#                 # 分配唯一的目标ID
+#                 tid = tid_counter
+#                 tid_counter += 1
+
+#                 # 构建位置信息和速度信息
+#                 position = np.array([x_center, y_center, w, h])
+#                 velocity = np.array([flow_x, flow_y])
+
+#                 # 将数据添加到 cells_by_t，包括置信度
+#                 if frame_number not in cells_by_t:
+#                     cells_by_t[frame_number] = []
+#                 cells_by_t[frame_number].append((tid, position, velocity, confidence, appearence))
+
+#         # 更新该视频的目标ID计数器
+#         tid_counters[video_name] = tid_counter
+
+#     return videos_cells_by_t
+
+
+import os
+import numpy as np
+from collections import defaultdict
+
+import os
+from collections import defaultdict
+
+def parse_all_ground_truths(base_path="data/viso/test"):
+    """
+    读取 base_path 下每个视频 <vid>/gt/gt.txt
+    返回:
+      video_gt_dict = {
+        '001': {
+           1: [(obj_id, x_min, y_min, w, h, conf, vx, vy, ...), ... ],
+           2: [...],
+           ...
+        },
+        '016': {...},
+        ...
+      }
+      first_appear_dict = {
+        ('001', obj_id): frame_id,
+        ...
+      }
+    """
+    video_gt_dict = {}
+    first_appear_dict = {}
+    
+    # 列出 test下所有子目录(每个视频)
+    videos = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    
+    for vid in videos:
+        gt_path = os.path.join(base_path, vid, "gt", "gt.txt")
+        if not os.path.exists(gt_path):
+            continue
+        
+        video_gt_dict[vid] = defaultdict(list)
+        
+        with open(gt_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) < 9:
+                    # 不够字段 => 跳过或报错
+                    continue
+                frame_id = int(parts[0])    # 可能1-based
+                obj_id   = int(parts[1])
+                x_min    = float(parts[2])
+                y_min    = float(parts[3])
+                w        = float(parts[4])
+                h        = float(parts[5])
+                conf     = float(parts[6])
+                vx       = float(parts[7])
+                vy       = float(parts[8])
+                # 若有更多字段，可继续
+                tup = (obj_id, x_min, y_min, w, h, conf, vx, vy)
+                video_gt_dict[vid][frame_id].append(tup)
+                
+                key = (vid, obj_id)
+                if key not in first_appear_dict:
+                    first_appear_dict[key] = frame_id  # 记录首次出现帧
+    
+    return video_gt_dict, first_appear_dict
+
+def overlap_exceed_10pct(det_box, gt_box):
+    """
+    det_box: (x_min, y_min, w, h)
+    gt_box : (x_min, y_min, w, h)
+    若相交面积 >= 0.1 * det_area => True
+    """
+    (dxmin, dymin, dw, dh) = det_box
+    (gxmin, gymin, gw, gh) = gt_box
+    
+    if dw<=0 or dh<=0:
+        return False
+    det_area = dw*dh
+    
+    # intersection
+    d_xmax = dxmin + dw
+    d_ymax = dymin + dh
+    g_xmax = gxmin + gw
+    g_ymax = gymin + gh
+    
+    inter_xmin = max(dxmin, gxmin)
+    inter_ymin = max(dymin, gymin)
+    inter_xmax = min(d_xmax, g_xmax)
+    inter_ymax = min(d_ymax, g_ymax)
+    
+    inter_w = max(0, inter_xmax - inter_xmin)
+    inter_h = max(0, inter_ymax - inter_ymin)
+    inter_area = inter_w*inter_h
+    
+    if inter_area >= 0.1*det_area:
+        return True
+    return False
+
+
+import numpy as np
+import os
+
+def build_videos_cells_by_t(
+    res,
+    video_gt_dict,
+    first_appear_dict,
+    area_percentage=10
+):
+    """
+    res: {image_path -> {1: array_of_detection, 'f1': features}}
+    video_gt_dict: 同 parse_all_ground_truths 返回
+    first_appear_dict: { (video_name, obj_id): first_frame_id }
+    area_percentage: 用于光流区域 => 10表示10%
+    
+    返回:
+      videos_cells_by_t = {
+        video_name: {
+          frame_number: [
+             (tid, position(4d), velocity(2d), conf, appearance),
+             ...
+          ]
+        }
+      }
+    """
+    videos_cells_by_t = {}
+    tid_counters = {}
+    
+    for image_path, detections_dict in res.items():
+        # 1) 提取 video_name & frame_number
+        path_parts = image_path.split('/')
+        try:
+            test_index = path_parts.index('test')
+            video_name = path_parts[test_index + 1]
+        except ValueError:
+            print(f"无法在路径中找到 'test': {image_path}")
+            continue
+        
+        if video_name not in videos_cells_by_t:
+            videos_cells_by_t[video_name] = {}
+            tid_counters[video_name] = 0
+        cells_by_t = videos_cells_by_t[video_name]
+        tid_counter = tid_counters[video_name]
+        
+        image_name = os.path.basename(image_path)
+        frame_number_str = os.path.splitext(image_name)[0]
+        frame_number = int(frame_number_str)  # 这里假设 => 1-based
+        
+        # 2) 构建 detection_list
+        detection_list = []
+        
+        boxes = detections_dict[1]       # shape [N,5] => (x_min,y_min,x_max,y_max,conf)
+        features = detections_dict['f1'] # shape [N, ...]
+        
+        for i, (box, feat) in enumerate(zip(boxes, features)):
+            x_min, y_min, x_max, y_max, confidence = box
+            if confidence<0.3:
+                continue
+            x_center = 0.5*(x_min+x_max)
+            y_center = 0.5*(y_min+y_max)
+            w = x_max - x_min
+            h = y_max - y_min
+            
+            # => 先 placeholder flow_x,flow_y=0
+            # 后面计算光流(见下)
+            flow_x, flow_y = 0.0, 0.0
+            
+            # we will fill flow_x,flow_y after area flow
+            # build detection => (tid, position, velocity, confidence, feat)
+            # tid:
+            tid = tid_counter
+            tid_counter += 1
+            
+            position = np.array([x_center,y_center,w,h], dtype=np.float32)
+            velocity = np.array([flow_x,flow_y], dtype=np.float32)
+            detection_list.append((tid, position, velocity, confidence, feat))
+        
+        # 3) 计算光流 => for each detection => 取 [region_x_min,region_x_max,...] 并 np.mean
+        #    这里和您原先代码一样
+        flow_dir = os.path.join(*path_parts[:test_index+2], 'flow')  # data/viso/test/XX/flow
+        flow_path = os.path.join(flow_dir, frame_number_str + '.npy')
+        if os.path.exists(flow_path):
+            flow_map = np.load(flow_path)  # shape [2, H, W]
+            flow_channels, flow_h, flow_w = flow_map.shape
+            
+            # 逐个更新 detection 的 flow
+            new_detection_list = []
+            for (tid, pos, vel, conf, feat) in detection_list:
+                x_c, y_c, ww, hh = pos
+                # area
+                region_w = ww * np.sqrt(area_percentage/100.0)
+                region_h = hh * np.sqrt(area_percentage/100.0)
+                
+                # region_x_min ...
+                region_x_min = max(int(x_c - region_w/2), int(x_c - ww/2))
+                region_y_min = max(int(y_c - region_h/2), int(y_c - hh/2))
+                region_x_max = min(int(x_c + region_w/2), int(x_c + ww/2))
+                region_y_max = min(int(y_c + region_h/2), int(y_c + hh/2))
+                
+                # clip to flow range
+                region_x_min = np.clip(region_x_min, 0, flow_w-1)
+                region_y_min = np.clip(region_y_min, 0, flow_h-1)
+                region_x_max = np.clip(region_x_max, 0, flow_w-1)
+                region_y_max = np.clip(region_y_max, 0, flow_h-1)
+                
+                if region_x_max>=region_x_min and region_y_max>=region_y_min:
+                    flow_region = flow_map[:, region_y_min:region_y_max+1, region_x_min:region_x_max+1]
+                    fx = np.mean(flow_region[0])
+                    fy = np.mean(flow_region[1])
+                else:
+                    fx, fy = 0.0,0.0
+                
+                velocity = np.array([fx,fy], dtype=np.float32)
+                new_detection_list.append( (tid, pos, velocity, conf, feat) )
+            
+            detection_list = new_detection_list
+        else:
+            # 不存在 => 保持velocity=0
+            pass
+        
+        # 4) 若 frame_number==1 => 用 GT 替换 detection_list
+        #    (请注意frame_number可能是1-based,如果您想0-based,请改 if frame_number==0)
+        if frame_number==1:
+            detection_list.clear()
+            # 读取 gt => video_gt_dict[video_name][1]
+            # 可能为空
+            if frame_number in video_gt_dict.get(video_name, {}):
+                gtlist = video_gt_dict[video_name][frame_number]
+                for (obj_id, gxmin, gymin, gw, gh, gconf, gvx, gvy) in gtlist:
+                    tid = tid_counter
+                    tid_counter+=1
+                    x_center = gxmin + 0.5*gw
+                    y_center = gymin + 0.5*gh
+                    position = np.array([x_center,y_center,gw,gh], dtype=np.float32)
+                    velocity = np.array([gvx,gvy], dtype=np.float32)
+                    
+                    # appearance先写None
+                    detection_list.append( (tid, position, velocity, gconf, None) )
+        
+        # 5) 处理 "首次出现" => 用 GT => 删除相交>10%
+        #    先看 gt 里有没有 frame_number
+        if frame_number in video_gt_dict.get(video_name, {}):
+            gtlist = video_gt_dict[video_name][frame_number]
+            filtered_list = detection_list[:]  # 先copy
+            for (obj_id, gxmin, gymin, gw, gh, gconf, gvx, gvy) in gtlist:
+                # 看 first_appear_dict
+                if (video_name, obj_id) in first_appear_dict:
+                    first_appear_frame = first_appear_dict[(video_name, obj_id)]
+                    if first_appear_frame == frame_number:
+                        # => 先删除相交>10%
+                        new_filtered = []
+                        gt_box = (gxmin, gymin, gw, gh)
+                        for (dtid, dpos, dvel, dconf, dfeat) in filtered_list:
+                            dxmin = dpos[0] - dpos[2]/2
+                            dymin = dpos[1] - dpos[3]/2
+                            dw    = dpos[2]
+                            dh    = dpos[3]
+                            det_box = (dxmin, dymin, dw, dh)
+                            if overlap_exceed_10pct(det_box, gt_box):
+                                # skip
+                                continue
+                            else:
+                                new_filtered.append( (dtid, dpos, dvel, dconf, dfeat) )
+                        
+                        filtered_list = new_filtered
+                        
+                        # 再添加这个 GT
+                        tid = tid_counter
+                        tid_counter+=1
+                        x_center = gxmin + 0.5*gw
+                        y_center = gymin + 0.5*gh
+                        position = np.array([x_center,y_center,gw,gh], dtype=np.float32)
+                        velocity = np.array([gvx,gvy], dtype=np.float32)
+                        filtered_list.append( (tid, position, velocity, gconf, None) )
+            
+            detection_list = filtered_list
+        
+        # 6) 将 detection_list 放入 cells_by_t
+        if frame_number not in cells_by_t:
+            cells_by_t[frame_number] = []
+        cells_by_t[frame_number].extend(detection_list)
+        
+        # 更新 tid
+        tid_counters[video_name] = tid_counter
+    
+    return videos_cells_by_t
+
+
+
+import motmetrics as mm
+import glob
+import pandas as pd
+
+def read_data(file_path):
+    """ Read data from given file path """
+    return pd.read_csv(
+        file_path,
+        header=None,
+        names=['frame', 'id', 'left', 'top', 'width', 'height', 'conf', 'x', 'y', 'z'],
+        index_col=False
+    )
+
+def convert_bbox_to_mot(df):
+    """ Convert bounding box to MOT challenge format (left, top, width, height) to (x1, y1, x2, y2) """
+    df['x1'] = df['left']
+    df['y1'] = df['top']
+    df['x2'] = df['left'] + df['width']
+    df['y2'] = df['top'] + df['height']
+    return df[['frame', 'id', 'x1', 'y1', 'x2', 'y2']]
+
+def evaluate(truths, predictions):
+    """ Evaluate tracking performance using MOT metrics """
+    acc = mm.MOTAccumulator(auto_id=True)
+    for frame in sorted(set(truths['frame'].unique()).union(set(predictions['frame'].unique()))):
+        gt = truths[truths['frame'] == frame]
+        pr = predictions[predictions['frame'] == frame]
+        gt_boxes = gt[['x1', 'y1', 'x2', 'y2']].values
+        pr_boxes = pr[['x1', 'y1', 'x2', 'y2']].values
+        distances = mm.distances.iou_matrix(gt_boxes, pr_boxes, max_iou=0.5)
+        acc.update(
+            gt['id'].values,
+            pr['id'].values,
+            distances
+        )
+    return acc
+
+
+if __name__ == '__main__':
+    opt = opts().parse()
+
+    split = 'test'
+    show_flag = opt.save_track_results
+    if (not os.path.exists(opt.save_results_dir)):
+        os.mkdir(opt.save_results_dir)
+
+    if opt.load_model != '':
+        modelPath = opt.load_model
+    else:
+        modelPath = './checkpoints/DSFNet.pth'
+    print(modelPath)
+
+    results_name = opt.model_name+'_'+modelPath.split('/')[-1].split('.')[0]
+    test(opt, split, modelPath, show_flag, results_name)
