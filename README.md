@@ -1,6 +1,6 @@
 # Satellite-borne Vehicles Tracking: A Motion Position Graph Approach and Dataset
 
-![outline](./readme/framework.jpg)
+![outline](./readme/framework.png)
 
 ## Algorithm Introduction
 
@@ -16,7 +16,7 @@ The trained weight is available at [[BaiduYun](https://pan.baidu.com/s/1_ZHEmP8n
 ## Data
 VDD-VEH contains 255 video sequences for tracking moving vehicles, of which 177 are used as training sets, 52 as validation sets, and 26 as test sets. All data were captured by the Jilin-1 satellite with a frame rate of 10FPS and a spatial resolution of 0.92m.
 
-<img src="diversity.png" width = 60%>
+<img src="./readme/dataset.png" width = 60%>
 
 The annotation file `gt.txt` contains information in the following format:
 
