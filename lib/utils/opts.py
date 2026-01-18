@@ -52,6 +52,8 @@ class opts(object):
                                  help='whether or not to show the detection results. Only for test.')
         self.parser.add_argument('--save_track_results', type=bool, default=False,
                                  help='whether or not to save the tracking results of sort. Only for testTrackingSort.')
+        self.parser.add_argument('--track_cfg', type=str, default='./optim_config.yaml',
+                                 help='tracking configuration file.')
 
         # save
         self.parser.add_argument('--save_dir', type=str, default='./weights',
