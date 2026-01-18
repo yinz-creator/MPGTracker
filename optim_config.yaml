@@ -1,0 +1,28 @@
+max_children: 3
+distance_threshold: 10
+confidence_threshold: 0.3
+confidence_function: "quadratic"
+
+weight_position: 1.0
+weight_velocity: 1.0
+weight_appearance: 1.0
+
+epsilon: 1
+gaussian_sigma: 1.0
+
+start_cost: 0.0
+end_cost: 0.0
+
+min_track_length: 5
+max_track_length: null
+
+density_threshold: 0.5
+min_distance_threshold: 3.0
+
+fragment_length_max: 15   
+max_gap: 10               
+Td: 5.0                  
+Tv: 6.0                   
+wp: 0.7                   
+wv: 0.3                   
+delta_FS: 0.4             
